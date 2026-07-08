@@ -582,9 +582,11 @@ bash-4.2$
 ### Phase 1: Salt Keys
 
 Mapper:
+The mapper appends a random suffix (0-9) to the hot key so it spreads across up to 10 reducers instead of 1; reducer sums each salted sub-key.
 - Reads customer transactions
 - Adds a random salt bucket (0-9)
 - Emits salted customer keys
+
 
 Example:
 CUST_HOT_3 -> 1250.50
@@ -592,9 +594,8 @@ CUST_HOT_7 -> 980.25
 
 Reducer:
 - Calculates partial sums for each salted key
-
 ### Phase 2: Remove Salt
-
+A second job strips the suffix and sums the partial sums into the true final total.
 Mapper:
 - Removes salt suffix
 
@@ -627,9 +628,168 @@ CUST_HOT 1270743.47
 The hot key was distributed across reducers, reducing the impact of data skew.
 
 
+### Java file to apply the salted key fix: 
+
+```
+cat > SalesSumSalted.java << 'EOF'
+import java.io.IOException;
+import java.util.Random;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.DoubleWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+
+public class SalesSumSalted {
+
+  // ---- Phase 1: salt the key, partial-sum per salted key ----
+  public static class SaltMapper
+       extends Mapper<Object, Text, Text, DoubleWritable> {
+    private Text saltedKey = new Text();
+    private DoubleWritable amount = new DoubleWritable();
+    private Random rand = new Random();
+    private static final int SALT_BUCKETS = 10;
+
+    public void map(Object key, Text value, Context context
+                     ) throws IOException, InterruptedException {
+      String[] parts = value.toString().split(",");
+      if (parts.length == 2) {
+        int salt = rand.nextInt(SALT_BUCKETS);
+        saltedKey.set(parts[0] + "_" + salt);
+        amount.set(Double.parseDouble(parts[1]));
+        context.write(saltedKey, amount);
+      }
+    }
+  }
+
+  public static class PartialSumReducer
+       extends Reducer<Text, DoubleWritable, Text, DoubleWritable> {
+    private DoubleWritable result = new DoubleWritable();
+
+    public void reduce(Text key, Iterable<DoubleWritable> values,
+                        Context context
+                        ) throws IOException, InterruptedException {
+      double sum = 0.0;
+      for (DoubleWritable val : values) sum += val.get();
+      result.set(sum);
+      context.write(key, result);
+    }
+  }
+
+  // ---- Phase 2: strip salt suffix, sum partials into true total ----
+  public static class StripSaltMapper
+       extends Mapper<Object, Text, Text, DoubleWritable> {
+    private Text customerId = new Text();
+    private DoubleWritable amount = new DoubleWritable();
+
+    public void map(Object key, Text value, Context context
+                     ) throws IOException, InterruptedException {
+      // input format: "CUST_HOT_3\t1234.56"
+      String[] parts = value.toString().split("\\s+");
+      if (parts.length == 2) {
+        String saltedKey = parts[0];
+        int lastUnderscore = saltedKey.lastIndexOf('_');
+        String originalKey = saltedKey.substring(0, lastUnderscore);
+        customerId.set(originalKey);
+        amount.set(Double.parseDouble(parts[1]));
+        context.write(customerId, amount);
+      }
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    // args: <input> <intermediate-output> <final-output>
+    Configuration conf1 = new Configuration();
+    Job job1 = Job.getInstance(conf1, "sales sum salted phase1");
+    job1.setJarByClass(SalesSumSalted.class);
+    job1.setMapperClass(SaltMapper.class);
+    job1.setCombinerClass(PartialSumReducer.class);
+    job1.setReducerClass(PartialSumReducer.class);
+    job1.setNumReduceTasks(4);
+    job1.setOutputKeyClass(Text.class);
+    job1.setOutputValueClass(DoubleWritable.class);
+    FileInputFormat.addInputPath(job1, new Path(args[0]));
+    FileOutputFormat.setOutputPath(job1, new Path(args[1]));
+    boolean success1 = job1.waitForCompletion(true);
+    if (!success1) System.exit(1);
+
+    Configuration conf2 = new Configuration();
+    Job job2 = Job.getInstance(conf2, "sales sum salted phase2");
+    job2.setJarByClass(SalesSumSalted.class);
+    job2.setMapperClass(StripSaltMapper.class);
+    job2.setCombinerClass(PartialSumReducer.class);
+    job2.setReducerClass(PartialSumReducer.class);
+    job2.setNumReduceTasks(4);
+    job2.setOutputKeyClass(Text.class);
+    job2.setOutputValueClass(DoubleWritable.class);
+    FileInputFormat.addInputPath(job2, new Path(args[1]));
+    FileOutputFormat.setOutputPath(job2, new Path(args[2]));
+    System.exit(job2.waitForCompletion(true) ? 0 : 1);
+  }
+}
+EOF
+
+javac -classpath $(hadoop classpath) -d . SalesSumSalted.java
+jar -cvf salessumsalted.jar -C . .
+```
+### Confirm files exist locally:
+``` ls ```
+You should see transactions.csv
+### Then upload it:
+```
+hdfs dfs -mkdir -p /input
+hdfs dfs -put transactions.csv /input/
+```
+### Verify it's in HDFS
+```
+hdfs dfs -ls /input
+```
+Expected output:``` -rw-r--r--   1 hadoop supergroup 92818 2026-07-08 /input/transactions.csv ```
+
+### Run the job
+```
+hadoop jar salessumsalted.jar SalesSumSalted \
+    /input/transactions.csv \
+    /salted_intermediate \
+    /salted_output
+```
+The key lines to look for are 
+- Job job_..._0003 completed successfully
+- Job job_..._0004 completed successfully
+The second job is the one that removes the salt and computes the final totals.
+### Phase 1
+Input records: 6000
+Output records: 207 (partial sums for salted keys)
+### Phase 2
+Input records: 207
+Output records: 21 (one total per customer)
+### Conclusion:
+6000 transactions were condensed into 207 salted partial sums, which were then merged into 21 final customer totals.
+
+Output:
+```
+bash-4.2$ hadoop jar salessumsalted.jar SalesSumSalted \ > /input/transactions.csv \ > /salted_intermediate \ > /salted_output 2026-07-08 17:12:08 INFO DefaultNoHARMFailoverProxyProvider:64 - Connecting to ResourceManager at /0.0.0.0:8032 2026-07-08 17:12:09 WARN JobResourceUploader:149 - Hadoop command-line option parsing not performed. Implement the Tool interface and execute your application with ToolRunner to remedy this. 2026-07-08 17:12:09 INFO JobResourceUploader:907 - Disabling Erasure Coding for path: /tmp/hadoop-yarn/staging/hadoop/.staging/job_1783529976283_0003 2026-07-08 17:12:09 INFO FileInputFormat:300 - Total input files to process : 1 2026-07-08 17:12:09 INFO JobSubmitter:202 - number of splits:1 2026-07-08 17:12:09 INFO JobSubmitter:298 - Submitting tokens for job: job_1783529976283_0003 2026-07-08 17:12:09 INFO JobSubmitter:299 - Executing with tokens: [] 2026-07-08 17:12:09 INFO Configuration:2854 - resource-types.xml not found 2026-07-08 17:12:09 INFO ResourceUtils:476 - Unable to find 'resource-types.xml'. 2026-07-08 17:12:09 INFO YarnClientImpl:338 - Submitted application application_1783529976283_0003 2026-07-08 17:12:09 INFO Job:1682 - The url to track the job: http://dd520c848268:8088/proxy/application_1783529976283_0003/ 2026-07-08 17:12:09 INFO Job:1727 - Running job: job_1783529976283_0003 2026-07-08 17:12:14 INFO Job:1748 - Job job_1783529976283_0003 running in uber mode : false 2026-07-08 17:12:14 INFO Job:1755 - map 0% reduce 0% 2026-07-08 17:12:18 INFO Job:1755 - map 100% reduce 0% 2026-07-08 17:12:22 INFO Job:1755 - map 100% reduce 25% 2026-07-08 17:12:23 INFO Job:1755 - map 100% reduce 50% 2026-07-08 17:12:24 INFO Job:1755 - map 100% reduce 75% 2026-07-08 17:12:25 INFO Job:1755 - map 100% reduce 100% 2026-07-08 17:12:26 INFO Job:1766 - Job job_1783529976283_0003 completed successfully 2026-07-08 17:12:27 INFO Job:1773 - Counters: 54 File System Counters FILE: Number of bytes read=4075 FILE: Number of bytes written=1387087 FILE: Number of read operations=0 FILE: Number of large read operations=0 FILE: Number of write operations=0 HDFS: Number of bytes read=92927 HDFS: Number of bytes written=4197 HDFS: Number of read operations=23 HDFS: Number of large read operations=0 HDFS: Number of write operations=8 HDFS: Number of bytes read erasure-coded=0 Job Counters Launched map tasks=1 Launched reduce tasks=4 Data-local map tasks=1 Total time spent by all maps in occupied slots (ms)=1659 Total time spent by all reduces in occupied slots (ms)=6920 Total time spent by all map tasks (ms)=1659 Total time spent by all reduce tasks (ms)=6920 Total vcore-milliseconds taken by all map tasks=1659 Total vcore-milliseconds taken by all reduce tasks=6920 Total megabyte-milliseconds taken by all map tasks=1698816 Total megabyte-milliseconds taken by all reduce tasks=7086080 Map-Reduce Framework Map input records=6000 Map output records=6000 Map output bytes=112500 Map output materialized bytes=4075 Input split bytes=109 Combine input records=6000 Combine output records=207 Reduce input groups=207 Reduce shuffle bytes=4075 Reduce input records=207 Reduce output records=207 Spilled Records=414 Shuffled Maps =4 Failed Shuffles=0 Merged Map outputs=4 GC time elapsed (ms)=179 CPU time spent (ms)=2210 Physical memory (bytes) snapshot=1337823232 Virtual memory (bytes) snapshot=13213868032 Total committed heap usage (bytes)=1010827264 Peak Map Physical memory (bytes)=360992768 Peak Map Virtual memory (bytes)=2637402112 Peak Reduce Physical memory (bytes)=257183744 Peak Reduce Virtual memory (bytes)=2646142976 Shuffle Errors BAD_ID=0 CONNECTION=0 IO_ERROR=0 WRONG_LENGTH=0 WRONG_MAP=0 WRONG_REDUCE=0 File Input Format Counters Bytes Read=92818 File Output Format Counters Bytes Written=4197 2026-07-08 17:12:27 INFO DefaultNoHARMFailoverProxyProvider:64 - Connecting to ResourceManager at /0.0.0.0:8032 2026-07-08 17:12:27 WARN JobResourceUploader:149 - Hadoop command-line option parsing not performed. Implement the Tool interface and execute your application with ToolRunner to remedy this. 2026-07-08 17:12:27 INFO JobResourceUploader:907 - Disabling Erasure Coding for path: /tmp/hadoop-yarn/staging/hadoop/.staging/job_1783529976283_0004 2026-07-08 17:12:27 INFO FileInputFormat:300 - Total input files to process : 4 2026-07-08 17:12:27 INFO JobSubmitter:202 - number of splits:4 2026-07-08 17:12:27 INFO JobSubmitter:298 - Submitting tokens for job: job_1783529976283_0004 2026-07-08 17:12:27 INFO JobSubmitter:299 - Executing with tokens: [] 2026-07-08 17:12:27 INFO YarnClientImpl:338 - Submitted application application_1783529976283_0004 2026-07-08 17:12:27 INFO Job:1682 - The url to track the job: http://dd520c848268:8088/proxy/application_1783529976283_0004/ 2026-07-08 17:12:27 INFO Job:1727 - Running job: job_1783529976283_0004 2026-07-08 17:12:37 INFO Job:1748 - Job job_1783529976283_0004 running in uber mode : false 2026-07-08 17:12:37 INFO Job:1755 - map 0% reduce 0% 2026-07-08 17:12:41 INFO Job:1755 - map 100% reduce 0% 2026-07-08 17:12:46 INFO Job:1755 - map 100% reduce 25% 2026-07-08 17:12:47 INFO Job:1755 - map 100% reduce 50% 2026-07-08 17:12:48 INFO Job:1755 - map 100% reduce 75% 2026-07-08 17:12:49 INFO Job:1755 - map 100% reduce 100% 2026-07-08 17:12:49 INFO Job:1766 - Job job_1783529976283_0004 completed successfully 2026-07-08 17:12:49 INFO Job:1773 - Counters: 54 File System Counters FILE: Number of bytes read=1500 FILE: Number of bytes written=2209644 FILE: Number of read operations=0 FILE: Number of large read operations=0 FILE: Number of write operations=0 HDFS: Number of bytes read=4673 HDFS: Number of bytes written=487 HDFS: Number of read operations=32 HDFS: Number of large read operations=0 HDFS: Number of write operations=8 HDFS: Number of bytes read erasure-coded=0 Job Counters Launched map tasks=4 Launched reduce tasks=4 Data-local map tasks=4 Total time spent by all maps in occupied slots (ms)=9081 Total time spent by all reduces in occupied slots (ms)=6931 Total time spent by all map tasks (ms)=9081 Total time spent by all reduce tasks (ms)=6931 Total vcore-milliseconds taken by all map tasks=9081 Total vcore-milliseconds taken by all reduce tasks=6931 Total megabyte-milliseconds taken by all map tasks=9298944 Total megabyte-milliseconds taken by all reduce tasks=7097344 Map-Reduce Framework Map input records=207 Map output records=207 Map output bytes=3223 Map output materialized bytes=1572 Input split bytes=476 Combine input records=207 Combine output records=84 Reduce input groups=21 Reduce shuffle bytes=1572 Reduce input records=84 Reduce output records=21 Spilled Records=168 Shuffled Maps =16 Failed Shuffles=0 Merged Map outputs=16 GC time elapsed (ms)=392 CPU time spent (ms)=3290 Physical memory (bytes) snapshot=2325065728 Virtual memory (bytes) snapshot=21126291456 Total committed heap usage (bytes)=1820852224 Peak Map Physical memory (bytes)=360927232 Peak Map Virtual memory (bytes)=2639163392 Peak Reduce Physical memory (bytes)=244527104 Peak Reduce Virtual memory (bytes)=2645803008 Shuffle Errors BAD_ID=0 CONNECTION=0 IO_ERROR=0 WRONG_LENGTH=0 WRONG_MAP=0 WRONG_REDUCE=0 File Input Format Counters Bytes Read=4197 File Output Format Counters Bytes Written=487
+```
 
 
 
+### View the final output
+
+```
+hdfs dfs -cat /salted_output/part-r-*
+```
+Output:
+```
+CUST_1    24583.71
+CUST_2    31791.04
+...
+CUST_HOT  8.95E7
+```
 
 
 
