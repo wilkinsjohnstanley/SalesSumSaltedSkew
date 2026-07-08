@@ -1,0 +1,18 @@
+# Java compiled files
+*.class
+
+# Hadoop build artifacts
+*.jar
+
+# Hadoop output
+salted_output/
+salted_intermediate/
+output/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
